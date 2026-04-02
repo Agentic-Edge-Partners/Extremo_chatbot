@@ -1,4 +1,4 @@
-"""Google Maps tools for place search, geocoding, and route calculation."""
+"""Google Maps tools for place search, geocoding, route calculation, and event route planning."""
 
 from __future__ import annotations
 
@@ -12,6 +12,40 @@ from langchain_core.tools import tool
 
 # Maximum distance (km) a place can be from the location center
 _MAX_RADIUS_KM = 15.0
+
+# ---------------------------------------------------------------------------
+# Activity type query hints — used to refine place search results
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_TYPE_QUERIES: dict[str, list[str]] = {
+    "natural_sights": [
+        "viewpoint", "park", "nature reserve", "beach", "waterfall",
+        "mountain", "hiking trail", "garden", "cliff", "forest",
+    ],
+    "cultural": [
+        "museum", "historic site", "monument", "wine cellar", "castle",
+        "palace", "church", "traditional market", "art gallery", "heritage",
+    ],
+    "restaurants": [
+        "restaurant", "wine bar", "traditional food", "tavern", "seafood",
+        "fine dining", "local cuisine", "tapas", "gastronomy",
+    ],
+    "venues": [
+        "event space", "hotel meeting room", "quinta", "conference venue",
+        "banquet hall", "retreat center", "manor house",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Competitor / excluded activity keywords — these get filtered OUT of results
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_KEYWORDS = [
+    "cycling", "bicycle", "bike rental", "bike tour", "biking",
+    "segway", "scooter", "e-bike", "tuk tuk", "tuk-tuk",
+    "hop on hop off", "hop-on hop-off", "bus tour",
+    "sliding", "slide",
+]
 
 
 def _maps_key() -> str | None:
@@ -45,6 +79,15 @@ def _geocode_location(location: str) -> tuple[float, float] | None:
     return None
 
 
+def _is_excluded_place(place: dict) -> bool:
+    """Check if a place matches any excluded competitor keywords."""
+    name = (place.get("displayName", {}).get("text", "") or "").lower()
+    summary = (place.get("editorialSummary", {}).get("text", "") or "").lower()
+    types = [t.lower() for t in place.get("types", [])]
+    combined = f"{name} {summary} {' '.join(types)}"
+    return any(kw in combined for kw in _EXCLUDED_KEYWORDS)
+
+
 # ---------------------------------------------------------------------------
 # Place Search (Google Places API — New)
 # ---------------------------------------------------------------------------
@@ -55,6 +98,7 @@ def search_places(
     location_bias: str = "Porto, Portugal",
     center_lat: float = 0.0,
     center_lng: float = 0.0,
+    activity_type: str = "general",
 ) -> str:
     """Search for real places, venues, and landmarks using Google Maps.
 
@@ -64,12 +108,20 @@ def search_places(
 
     Results are restricted to a 15 km radius from the center of the target
     location. Places outside this radius are automatically filtered out.
+    Competitor activities (cycling tours, bike rentals, segway, scooter tours,
+    tuk-tuk tours) are automatically excluded from results.
 
     Args:
         query: Specific place search, e.g. 'wine cellars Vila Nova de Gaia'
         location_bias: City or area to bias results toward
         center_lat: Latitude of the center point (0 = auto-geocode from location_bias)
         center_lng: Longitude of the center point (0 = auto-geocode from location_bias)
+        activity_type: Filter results by type. Options:
+            - 'natural_sights' — Viewpoints, parks, nature reserves, beaches, waterfalls
+            - 'cultural' — Museums, historic sites, monuments, wine cellars, castles
+            - 'restaurants' — Restaurants, wine bars, traditional food experiences
+            - 'venues' — Event spaces, hotels with meeting rooms, quintas
+            - 'general' — No filter (default)
     """
     api_key = _maps_key()
     if not api_key:
@@ -81,11 +133,20 @@ def search_places(
         if coords:
             center_lat, center_lng = coords
 
+    # Refine the query with activity type hints if applicable
+    type_hints = _ACTIVITY_TYPE_QUERIES.get(activity_type, [])
+    if type_hints and activity_type != "general":
+        # Add the first few type hints to help bias the search
+        hint_text = " OR ".join(type_hints[:3])
+        search_query = f"{query} ({hint_text}) near {location_bias}"
+    else:
+        search_query = f"{query} near {location_bias}"
+
     url = "https://places.googleapis.com/v1/places:searchText"
 
     request_body: dict = {
-        "textQuery": f"{query} near {location_bias}",
-        "maxResultCount": 10,
+        "textQuery": search_query,
+        "maxResultCount": 15,
         "languageCode": "en",
     }
 
@@ -122,6 +183,10 @@ def search_places(
 
     results = []
     for p in data.get("places", []):
+        # Exclude competitor activities
+        if _is_excluded_place(p):
+            continue
+
         loc = p.get("location", {})
         lat = loc.get("latitude")
         lng = loc.get("longitude")
@@ -145,7 +210,7 @@ def search_places(
 
     if not results:
         return "No places found for this query."
-    return json.dumps(results, indent=2)
+    return json.dumps(results[:10], indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +313,238 @@ def get_travel_time(
 
 
 # ---------------------------------------------------------------------------
+# Event Route Planner (with pickup/drop-off and optimization)
+# ---------------------------------------------------------------------------
+
+def _compute_route_leg(
+    api_key: str,
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+) -> dict:
+    """Compute a single route leg between two coordinate pairs."""
+    url = "https://routes.googleapis.com/directions/v2:computeRoutes"
+    body = json.dumps({
+        "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
+        "destination": {"location": {"latLng": {"latitude": destination[0], "longitude": destination[1]}}},
+        "travelMode": "DRIVE",
+        "routingPreference": "TRAFFIC_AWARE",
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "routes.duration,routes.distanceMeters",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+
+    routes = data.get("routes", [])
+    if not routes:
+        return {"duration_minutes": 0, "distance_km": 0}
+
+    route = routes[0]
+    duration_sec = int(route.get("duration", "0s").rstrip("s"))
+    distance_m = route.get("distanceMeters", 0)
+    return {
+        "duration_minutes": round(duration_sec / 60, 1),
+        "distance_km": round(distance_m / 1000, 1),
+    }
+
+
+def _resolve_stop(stop: dict) -> tuple[float, float] | None:
+    """Resolve a stop to (lat, lng) — use existing coords or geocode the name."""
+    lat = stop.get("latitude")
+    lng = stop.get("longitude")
+    if lat and lng:
+        return (lat, lng)
+    name = stop.get("name", "")
+    if name:
+        return _geocode_location(name)
+    return None
+
+
+def _optimize_stop_order(
+    api_key: str,  # unused — kept for future upgrade to driving-time optimization
+    coords: list[tuple[float, float]],
+) -> list[int]:
+    """Find a good ordering for intermediate stops using nearest-neighbor heuristic.
+
+    Uses straight-line (haversine) distance rather than actual driving time to
+    avoid O(n^2) API calls. For typical corporate events (3-8 stops in the same
+    region), this produces near-optimal results. A full driving-time matrix would
+    be more accurate but requires n*(n-1)/2 Routes API calls.
+    """
+    if len(coords) <= 1:
+        return list(range(len(coords)))
+
+    n = len(coords)
+    visited = [False] * n
+    order = [0]
+    visited[0] = True
+
+    for _ in range(n - 1):
+        current = order[-1]
+        best_idx = -1
+        best_dist = float("inf")
+        for j in range(n):
+            if not visited[j]:
+                d = _haversine_km(
+                    coords[current][0], coords[current][1],
+                    coords[j][0], coords[j][1],
+                )
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = j
+        if best_idx >= 0:
+            visited[best_idx] = True
+            order.append(best_idx)
+
+    return order
+
+
+@tool
+def plan_event_route(
+    pickup: str,
+    dropoff: str,
+    stops_json: str,
+    optimize: bool = True,
+) -> str:
+    """Plan an optimized event route with pickup and drop-off points.
+
+    Creates a full driving route for a corporate event day. Takes a pickup location
+    (start), drop-off location (end), and intermediate activity stops. Can
+    optionally reorder stops to minimize total travel time.
+
+    Returns the ordered itinerary with travel times between each stop, total
+    duration, total distance, and a Google Maps URL for the route.
+
+    Args:
+        pickup: Pickup location (start of the route), e.g. 'Hotel Pestana Porto'
+        dropoff: Drop-off location (end of the route), e.g. 'Hotel Pestana Porto'
+            (often the same as pickup)
+        stops_json: JSON string of intermediate stops. Each stop must have 'name'
+            and optionally 'latitude'/'longitude'. Example:
+            '[{"name": "Livraria Lello"}, {"name": "Caves Porto Calem",
+              "latitude": 41.137, "longitude": -8.627}]'
+        optimize: If true, reorder intermediate stops to minimize travel time.
+            Defaults to true.
+    """
+    api_key = _maps_key()
+    if not api_key:
+        return "Error: GOOGLE_MAPS_API_KEY not set"
+
+    # Parse stops
+    try:
+        stops = json.loads(stops_json) if isinstance(stops_json, str) else stops_json
+    except (json.JSONDecodeError, TypeError):
+        return "Error: stops_json must be a valid JSON array"
+
+    if not stops:
+        return "Error: at least one intermediate stop is required"
+
+    # Resolve all locations
+    pickup_coords = _geocode_location(pickup)
+    if not pickup_coords:
+        return f"Error: could not geocode pickup location '{pickup}'"
+
+    dropoff_coords = _geocode_location(dropoff)
+    if not dropoff_coords:
+        return f"Error: could not geocode drop-off location '{dropoff}'"
+
+    resolved_stops = []
+    for i, stop in enumerate(stops):
+        coords = _resolve_stop(stop)
+        if not coords:
+            return f"Error: could not geocode stop #{i + 1}: '{stop.get('name', 'unknown')}'"
+        resolved_stops.append({
+            "name": stop.get("name", f"Stop {i + 1}"),
+            "latitude": coords[0],
+            "longitude": coords[1],
+        })
+
+    # Optimize order if requested
+    if optimize and len(resolved_stops) > 1:
+        stop_coords = [(s["latitude"], s["longitude"]) for s in resolved_stops]
+        optimized_indices = _optimize_stop_order(api_key, stop_coords)
+        resolved_stops = [resolved_stops[i] for i in optimized_indices]
+
+    # Build the full route: pickup -> stops -> dropoff
+    all_points = [
+        {"name": pickup, "latitude": pickup_coords[0], "longitude": pickup_coords[1]},
+        *resolved_stops,
+        {"name": dropoff, "latitude": dropoff_coords[0], "longitude": dropoff_coords[1]},
+    ]
+
+    # Calculate leg-by-leg travel times
+    legs = []
+    total_duration = 0.0
+    total_distance = 0.0
+
+    for i in range(len(all_points) - 1):
+        origin = (all_points[i]["latitude"], all_points[i]["longitude"])
+        dest = (all_points[i + 1]["latitude"], all_points[i + 1]["longitude"])
+        try:
+            leg = _compute_route_leg(api_key, origin, dest)
+        except Exception as e:
+            leg = {"duration_minutes": 0, "distance_km": 0, "error": str(e)}
+
+        legs.append({
+            "from": all_points[i]["name"],
+            "to": all_points[i + 1]["name"],
+            "duration_minutes": leg["duration_minutes"],
+            "distance_km": leg["distance_km"],
+        })
+        total_duration += leg["duration_minutes"]
+        total_distance += leg["distance_km"]
+
+    # Build Google Maps URL
+    maps_stops = [
+        {"name": p["name"], "latitude": p["latitude"], "longitude": p["longitude"]}
+        for p in all_points
+    ]
+    maps_url = _build_maps_url(maps_stops)
+
+    return json.dumps({
+        "route_order": [p["name"] for p in all_points],
+        "legs": legs,
+        "total_driving_minutes": round(total_duration, 1),
+        "total_distance_km": round(total_distance, 1),
+        "optimized": optimize,
+        "google_maps_url": maps_url,
+    }, indent=2)
+
+
+def _build_maps_url(stops: list[dict]) -> str:
+    """Build a Google Maps directions URL from a list of stop dicts."""
+    if len(stops) < 2:
+        return ""
+
+    def _place_str(stop: dict) -> str:
+        if stop.get("latitude") and stop.get("longitude"):
+            return f"{stop['latitude']},{stop['longitude']}"
+        return stop.get("name", "Unknown")
+
+    params = {
+        "api": "1",
+        "origin": _place_str(stops[0]),
+        "destination": _place_str(stops[-1]),
+        "travelmode": "driving",
+    }
+
+    if len(stops) > 2:
+        waypoints = "|".join(_place_str(s) for s in stops[1:-1])
+        params["waypoints"] = waypoints
+
+    query_string = urllib.parse.urlencode(params)
+    return f"https://www.google.com/maps/dir/?{query_string}"
+
+
+# ---------------------------------------------------------------------------
 # Google Maps URL Builder
 # ---------------------------------------------------------------------------
 
@@ -270,27 +567,4 @@ def build_google_maps_url(stops_json: str) -> str:
     if not stops or len(stops) < 2:
         return "Need at least 2 stops to build a route URL."
 
-    def _place_str(stop: dict) -> str:
-        if stop.get("latitude") and stop.get("longitude"):
-            return f"{stop['latitude']},{stop['longitude']}"
-        return stop.get("name", "Unknown")
-
-    origin = urllib.parse.quote(_place_str(stops[0]))
-    destination = urllib.parse.quote(_place_str(stops[-1]))
-
-    # Use the Google Maps Directions URL format which renders the actual route path
-    params = {
-        "api": "1",
-        "origin": _place_str(stops[0]),
-        "destination": _place_str(stops[-1]),
-        "travelmode": "driving",
-    }
-
-    if len(stops) > 2:
-        waypoints = "|".join(_place_str(s) for s in stops[1:-1])
-        params["waypoints"] = waypoints
-
-    query_string = urllib.parse.urlencode(params)
-    url = f"https://www.google.com/maps/dir/?{query_string}"
-
-    return url
+    return _build_maps_url(stops)

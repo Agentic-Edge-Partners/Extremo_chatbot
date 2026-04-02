@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Extremo Ambiente Chatbot — Simple EC2 deployment (~$22/month).
+  Single EC2 instance running Docker Compose with PostgreSQL, Redis,
+  LangGraph backend, and Next.js frontend. Good for prototypes and demos.
+
+# ===========================================================================
+# Parameters
+# ===========================================================================
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type (t3.small recommended)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access
+
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Description: OpenAI API key for GPT-4o
+
+  GoogleMapsApiKey:
+    Type: String
+    NoEcho: true
+    Description: Google Maps API key (Places, Routes, Geocoding)
+
+  LangSmithApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: LangSmith API key for tracing (optional)
+
+  LangChainProject:
+    Type: String
+    Default: extremoambiente-a2
+    Description: LangChain/LangSmith project name
+
+  GitRepoURL:
+    Type: String
+    Default: https://github.com/your-user/Extremo_chatbot.git
+    Description: Git repository URL to clone on the instance
+
+  AllowedSSHCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed to SSH (restrict to your IP for security)
+
+# ===========================================================================
+# Mappings — Ubuntu 24.04 LTS AMI per region
+# ===========================================================================
+Mappings:
+  RegionAMI:
+    us-east-1:
+      AMI: ami-0c7217cdde317cfec
+    us-west-2:
+      AMI: ami-03f65b8614a860c29
+    eu-west-1:
+      AMI: ami-0694d931cee176e7d
+    eu-central-1:
+      AMI: ami-0faab6bdbac9486fb
+    ap-southeast-1:
+      AMI: ami-078c1149d8ad719a7
+
+# ===========================================================================
+# Resources
+# ===========================================================================
+Resources:
+
+  # -------------------------------------------------------------------------
+  # VPC — Simple single-subnet setup
+  # -------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: extremo-ec2-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: extremo-ec2-igw
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: extremo-ec2-public
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: extremo-ec2-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # -------------------------------------------------------------------------
+  # Security Group — HTTP + SSH
+  # -------------------------------------------------------------------------
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Extremo Ambiente EC2 — HTTP (3000) + SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHCidr
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: extremo-ec2-sg
+
+  # -------------------------------------------------------------------------
+  # IAM Role — minimal (CloudWatch logs)
+  # -------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: extremo-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # -------------------------------------------------------------------------
+  # Elastic IP — stable public IP across reboots
+  # -------------------------------------------------------------------------
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref EC2Instance
+      AllocationId: !GetAtt ElasticIP.AllocationId
+
+  # -------------------------------------------------------------------------
+  # EC2 Instance — Ubuntu 24.04 + Docker Compose
+  # -------------------------------------------------------------------------
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", AMI]
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: extremo-chatbot
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              exec > /var/log/user-data.log 2>&1
+
+              echo "==> Installing Docker..."
+              apt-get update
+              apt-get install -y ca-certificates curl git
+              install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+              chmod a+r /etc/apt/keyrings/docker.asc
+
+              ARCH=$(dpkg --print-architecture)
+              CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+              echo "deb [arch=$ARCH signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $CODENAME stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+              apt-get update
+              apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+              usermod -aG docker ubuntu
+
+              echo "==> Cloning repository..."
+              git clone ${GitRepoURL} /home/ubuntu/app
+              chown -R ubuntu:ubuntu /home/ubuntu/app
+
+              echo "==> Creating .env file..."
+              cat > /home/ubuntu/app/.env << ENVEOF
+OPENAI_API_KEY=${OpenAIApiKey}
+GOOGLE_MAPS_API_KEY=${GoogleMapsApiKey}
+LANGSMITH_API_KEY=${LangSmithApiKey}
+LANGCHAIN_PROJECT=${LangChainProject}
+ENVEOF
+              # Only enable tracing if a LangSmith key was provided
+              if [[ -n "${LangSmithApiKey}" ]]; then
+                echo "LANGCHAIN_TRACING_V2=true" >> /home/ubuntu/app/.env
+              fi
+              chown ubuntu:ubuntu /home/ubuntu/app/.env
+              chmod 600 /home/ubuntu/app/.env
+
+              echo "==> Getting public IP..."
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+              PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+              echo "PUBLIC_IP=$PUBLIC_IP" >> /home/ubuntu/app/.env
+
+              echo "==> Starting Docker Compose..."
+              cd /home/ubuntu/app
+              sudo -u ubuntu NEXT_PUBLIC_API_URL="http://$PUBLIC_IP:3000/api" \
+              LANGGRAPH_API_URL="http://backend:8000" \
+              docker compose up -d --build
+
+              echo "==> Setup complete!"
+              echo "Frontend: http://$PUBLIC_IP:3000"
+              echo "Backend:  http://$PUBLIC_IP:8123"
+            - GitRepoURL: !Ref GitRepoURL
+              OpenAIApiKey: !Ref OpenAIApiKey
+              GoogleMapsApiKey: !Ref GoogleMapsApiKey
+              LangSmithApiKey: !Ref LangSmithApiKey
+              LangChainProject: !Ref LangChainProject
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Group
+  # -------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ec2/extremo-chatbot
+      RetentionInDays: 30
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref EC2Instance
+
+  PublicIP:
+    Description: Public IP address (stable Elastic IP)
+    Value: !Ref ElasticIP
+
+  FrontendURL:
+    Description: Chat UI URL
+    Value: !Sub http://${ElasticIP}:3000
+
+  BackendURL:
+    Description: LangGraph API URL (internal only — proxied via frontend /api)
+    Value: !Sub http://${ElasticIP}:8123 (not publicly accessible)
+
+  SSHCommand:
+    Description: SSH into the instance
+    Value: !Sub ssh -i ${KeyPairName}.pem ubuntu@${ElasticIP}
+
+  MonthlyCostEstimate:
+    Description: Approximate monthly cost (EC2 + EIP + 30GB EBS)
+    Value: "~$22/month for t3.small in eu-west-1"

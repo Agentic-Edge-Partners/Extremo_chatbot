@@ -1,3 +1,9 @@
+# Local development docker-compose
+# For production (AWS), replace postgres/redis with:
+#   - AWS RDS (PostgreSQL): set POSTGRES_URI to your RDS endpoint
+#   - AWS ElastiCache (Redis): set REDIS_URI to your ElastiCache endpoint
+#   - AWS ECS (Fargate) or EC2: run backend + frontend containers
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -46,10 +52,12 @@ services:
       context: ./ui
       dockerfile: Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8123}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3000/api}
         NEXT_PUBLIC_ASSISTANT_ID: agent
     ports:
       - "3000:3000"
+    environment:
+      LANGGRAPH_API_URL: ${LANGGRAPH_API_URL:-http://backend:8000}
     depends_on:
       - backend
     restart: unless-stopped
